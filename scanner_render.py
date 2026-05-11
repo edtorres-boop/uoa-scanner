@@ -1,93 +1,69 @@
-import yfinance as yf
-import pandas as pd
+import yfinance as yf, pandas as pd, os, requests, time
 from datetime import datetime
-import os
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Top 50 US por market cap - foco liquidez
-TICKERS = [
-"NVDA","MSFT","AAPL","AMZN","GOOGL","GOOG","META","AVGO","TSLA","BRK-B",
-"JPM","LLY","V","UNH","XOM","MA","COST","HD","PG","JNJ",
-"NFLX","BAC","CRM","ABBV","ORCL","WMT","AMD","KO","CVX","MRK",
-"TMO","ACN","PEP","ADBE","CSCO","LIN","DHR","MCD","WFC","IBM",
-"GE","RTX","QCOM","TXN","AMGN","INTU","CAT","NOW","DIS","VZ"
-]
+TICKERS = ["NVDA","MSFT","AAPL","AMZN","GOOGL","GOOG","META","AVGO","TSLA","BRK-B",
+"JPM","LLY","V","UNH","XOM","MA","COST","HD","PG","JNJ","NFLX","BAC","CRM","ABBV",
+"ORCL","WMT","AMD","KO","CVX","MRK","TMO","ACN","PEP","ADBE","CSCO","LIN","DHR",
+"MCD","WFC","IBM","GE","RTX","QCOM","TXN","AMGN","INTU","CAT","NOW","DIS","VZ"]
 
 MIN_PREMIUM = 100_000
 MIN_VOL_OI = 10
-EXPIRATIONS_TO_CHECK = 6
-MAX_WORKERS = 12
+EXPIRATIONS = 6
+WORKERS = 5   # menos workers = menos bloqueio Yahoo
 
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def tg(msg):
+    print("TELEGRAM:", msg[:80])
+    if not TELEGRAM_TOKEN: return
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-    except:
-        pass
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=15)
+        print("TG status", r.status_code)
+    except Exception as e:
+        print("TG error", e)
 
-def scan_ticker(ticker):
-    out = []
+def scan(t):
+    out=[]
     try:
-        tk = yf.Ticker(ticker)
-        exps = tk.options[:EXPIRATIONS_TO_CHECK]
+        tk=yf.Ticker(t)
+        exps = tk.options[:EXPIRATIONS]
         spot = tk.history(period="1d")["Close"].iloc[-1]
         for exp in exps:
-            time.sleep(0.15)
+            time.sleep(0.4)  # dá respiro ao Yahoo
             try:
                 calls = tk.option_chain(exp).calls
-                calls = calls[(calls['volume']>0) & (calls['openInterest']>0)].copy()
-                calls['vol_oi'] = calls['volume'] / calls['openInterest']
-                calls = calls[calls['vol_oi'] >= MIN_VOL_OI]
-                for _, r in calls.iterrows():
-                    prem = r['volume'] * r['lastPrice'] * 100
+                calls = calls[(calls.volume>0)&(calls.openInterest>0)].copy()
+                calls['r'] = calls.volume/calls.openInterest
+                calls = calls[calls.r >= MIN_VOL_OI]
+                for _,r in calls.iterrows():
+                    prem = r.volume * r.lastPrice * 100
                     if prem >= MIN_PREMIUM:
-                        out.append({
-                            'ticker': ticker,
-                            'strike': r['strike'],
-                            'exp': exp,
-                            'vol': int(r['volume']),
-                            'oi': int(r['openInterest']),
-                            'ratio': round(r['vol_oi'],1),
-                            'premium': int(prem),
-                            'spot': round(spot,2),
-                            'price': r['lastPrice']
-                        })
-            except:
-                continue
-    except:
-        pass
+                        out.append({'t':t,'s':r.strike,'e':exp,'v':int(r.volume),'o':int(r.openInterest),'x':round(r.r,1),'p':int(prem),'spot':round(spot,2)})
+            except Exception as e:
+                print(t, exp, "erro", e)
+    except Exception as e:
+        print(t, "falhou", e)
     return out
 
 def main():
-    now = datetime.now()
-    if now.weekday() > 4:
-        send_telegram("🏖️ Fim de semana")
+    now=datetime.now()
+    if now.weekday()>4:
+        tg("🏖️ Fim de semana"); return
+    res=[]
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs=[ex.submit(scan,t) for t in TICKERS]
+        for f in as_completed(futs): res.extend(f.result())
+    print("Total encontrados:", len(res))
+    if not res:
+        tg(f"✅ Top50 {now.strftime('%H:%M')} - Sem CALLS (Yahoo pode ter bloqueado)")
         return
+    res.sort(key=lambda x:x['p'], reverse=True)
+    msg=f"🚨 *TOP50* {now.strftime('%H:%M')}\n"
+    for r in res[:10]:
+        msg+=f"{r['t']} C{r['s']} {r['e']} ${r['p']:,} {r['x']}x\n"
+    tg(msg)
 
-    results = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = [ex.submit(scan_ticker, t) for t in TICKERS]
-        for f in as_completed(futs):
-            results.extend(f.result())
-
-    if not results:
-        send_telegram(f"✅ Top50 {now.strftime('%H:%M')} - Sem CALLS ≥$100k Vol/OI≥10")
-        return
-
-    results.sort(key=lambda x: x['premium'], reverse=True)
-    msg = f"🚨 *TOP50 CALLS - ${MIN_PREMIUM/1000:.0f}k+ Vol/OI≥{MIN_VOL_OI}*\n{now.strftime('%d/%m %H:%M')} LIS\n\n"
-    for r in results[:12]:
-        msg += f"*{r['ticker']}* ${r['spot']} → C${r['strike']} {r['exp']}\n"
-        msg += f"Vol:{r['vol']:,} OI:{r['oi']:,} {r['ratio']}x ${r['premium']:,}\n\n"
-    
-    send_telegram(msg)
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
